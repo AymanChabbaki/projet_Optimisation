@@ -210,7 +210,7 @@ def train_with_optimizer(
         output_dir                  = f"{OUTPUT_DIR}/{optimizer_name}",
         num_train_epochs            = num_epochs,
         per_device_train_batch_size = batch_size,
-        per_device_eval_batch_size  = 64,
+        per_device_eval_batch_size  = min(batch_size * 2, 128),
         evaluation_strategy         = "epoch",
         save_strategy               = "epoch",
         load_best_model_at_end      = True,
@@ -220,9 +220,12 @@ def train_with_optimizer(
         logging_steps               = 50,
         report_to                   = "none",
         seed                        = SEED,
-        # Use mixed-precision on GPU; CPU-only runs stay FP32
+        # Mixed-precision: fp16 on CUDA, plain FP32 on CPU
         fp16                        = torch.cuda.is_available(),
-        dataloader_num_workers      = 0,   # 0 is safer on Windows/Colab
+        # pin_memory speeds up CPU→GPU tensor transfers significantly
+        dataloader_pin_memory       = torch.cuda.is_available(),
+        # 0 workers is required on Windows; increase to 2-4 on Linux/Colab
+        dataloader_num_workers      = 0,
     )
 
     trainer = Trainer(
@@ -279,11 +282,25 @@ def train_with_optimizer(
 
 
 # ── Master Benchmark Loop ─────────────────────────────────────────────────────
+def _auto_batch_size() -> int:
+    """Pick batch size based on available VRAM. MiniLM-L12 + fp16 + seq128."""
+    if not torch.cuda.is_available():
+        return 32
+    vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    if vram_gb >= 16:
+        return 256
+    if vram_gb >= 8:
+        return 128
+    if vram_gb >= 4:
+        return 64   # Quadro T1000 sweet spot
+    return 32
+
+
 def run_optimizer_benchmark(
     tokenized_dataset,
     lr: float       = 2e-5,
     num_epochs: int = 3,
-    batch_size: int = 32,
+    batch_size: int | None = None,   # None → auto-detect from VRAM
 ) -> tuple[list[dict], dict]:
     """
     Run all 5 optimizer experiments sequentially.
@@ -296,15 +313,25 @@ def run_optimizer_benchmark(
     """
     OPTIMIZERS = ["AdamW", "Adafactor", "Lion", "LAMB", "SGD"]
 
+    if batch_size is None:
+        batch_size = _auto_batch_size()
+
     all_results  = []
     best_result  = None
     best_trainer = None
     best_f1      = -1.0
 
+    device_info = (
+        f"CUDA ({torch.cuda.get_device_name(0)}, "
+        f"{torch.cuda.get_device_properties(0).total_memory//1024**3} GB)"
+        if torch.cuda.is_available() else "CPU"
+    )
     print("\n" + "=" * 60)
     print("  BLOCK 2 — Optimizer Benchmark")
+    print(f"  Device     : {device_info}")
     print(f"  Optimizers : {OPTIMIZERS}")
     print(f"  Epochs     : {num_epochs}  |  Batch : {batch_size}  |  LR : {lr}")
+    print("  NOTE: first 5-10 steps are slow (CUDA kernel warmup) — normal!")
     print("=" * 60)
 
     for opt_name in OPTIMIZERS:
